@@ -1,0 +1,393 @@
+---
+title: "Trading Simulation"
+author: "Royce Yang & Chen Xu"
+date: "3/5/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lubridate)
+library(PerformanceAnalytics)
+library(rlist)
+```
+
+## Introduction
+
+We have finished our preliminary analysis and now we want to conduct a simulation. This simulation takes place on 2016-10-01 thru 2016-12-30. This means that the data we use to create our model will be strictly from before 2016-10-01. The strategy is that we will only decide to buy or not at 9:30 am (taking the opening price) and we will always sell all our stocks at 4:00 pm (at the closing price).
+
+## Data Preprocessing
+
+### Import & Cleaning
+
+```{r}
+news_data1 = read.csv(file="../1_Data/top_5_positive_news.csv")
+market_data1 = read.csv("../1_Data/top_5_positive_market.csv")
+
+news_data2 = read.csv("../1_Data/top_5_negative_news.csv")
+market_data2 = read.csv("../1_Data/top_5_negative_market.csv")
+
+news_data3 = read.csv("../1_Data/top_5_mcap_news.csv")
+market_data3 = read.csv("../1_Data/top_5_mcap_market.csv")
+market_data3<-subset(market_data3,select=-c(market_cap))
+
+news_data = rbind(news_data1, news_data2, news_data3)
+market_data = rbind(market_data1, market_data2, market_data3)
+
+news_data$date = as.Date(news_data$sourceTimestamp)
+market_data$date = as.Date(market_data$time)
+```
+
+### Time Analysis of News Data
+
+How much news is published afterhours?
+
+```{r}
+news_data$timestring = as.character(news_data$sourceTimestamp)
+
+news_count_total = length(news_data$sourceTimestamp)
+open_time = "14:30:00+00:00" # 2:30 pm UTC time is 9:30 am in New York, when stock exchanges open
+close_time = "21:00:00+00:00"
+news_data_before_open = news_data[which(news_data$timestring < paste(news_data$date, open_time)), ]
+news_data_after_close = news_data[which(news_data$timestring > paste(news_data$date, close_time)), ]
+
+news_count_afterhours = length(news_data_before_open$date) + length(news_data_after_close$date)
+percent_news_afterhours = news_count_afterhours / news_count_total
+percent_news_afterhours
+```
+
+### Merging
+
+With new information, we can merge in a new way.
+
+```{r}
+news_data_after_close$date = news_data_after_close$date + days(1) # attribute to next day
+news_data_afterhours = rbind(news_data_after_close, news_data_before_open)
+
+merged_data = merge(market_data, news_data_afterhours, by=c("date", "assetName"))
+merged_data = na.omit(merged_data) # in case some rows have incomplete data
+
+merged_data$up = ifelse(merged_data$close - merged_data$open > 0, 1, 0)
+merged_data$negative = ifelse(merged_data$sentimentClass == -1, 1, 0)
+merged_data$positive = ifelse(merged_data$sentimentClass == 1, 1, 0)
+```
+
+### Train-Validation-Test Split
+
+We split 80-20 for training-validation and we use the last 3 months (i.e. the duration of our simulation) of data for testing.
+
+```{r}
+sdate = "2016-10-01"
+edate = "2016-12-31"
+
+num_days = as.numeric(as.Date(as.character(edate), format="%Y-%m-%d")-
+                  as.Date(as.character(sdate), format="%Y-%m-%d")) + 1
+
+test = with(merged_data, merged_data[merged_data$date >= sdate & merged_data$date <= edate, ])
+remain = with(merged_data, merged_data[!(merged_data$date >= sdate & merged_data$date <= edate), ])
+t_idx = sample(nrow(remain), round(0.8 * nrow(remain)))
+train = remain[t_idx,]
+val = remain[-t_idx,]
+val<-na.omit(val)
+```
+
+### Cleaning Our Environment
+
+We remove all the unnecessary objects created during our preprocessing.
+
+```{r}
+rm(list=setdiff(ls(), c("train", "test", "val", "num_days")))
+```
+
+## Running A Basic Simulation
+
+### Changes
+first test model on validation
+
+### First, Create Our Model
+
+I use continuous sentiment score rather than the discrete 0 or 1.
+```{r}
+pos<-function(data)
+{
+  data$positive<-ifelse(data$negative==0,1,0)
+  return(data)
+}
+test<-pos(test)
+train<-pos(train)
+val<-pos(val)
+# Define Covariates and Response
+Y = paste("up", "~") # Binary response
+covariate<-c("close") # price only
+covariate2<-c(covariate,"returnsClosePrevMktres1") # + return
+covariate3<-c(covariate2,"sentimentNegative", "sentimentPositive","relevance","noveltyCount24H", "volumeCounts24H", "firstMentionSentence") # + all news, not including providers
+covariate4<-c("sentimentNegative", "sentimentPositive","relevance","noveltyCount24H", "volumeCounts24H", "firstMentionSentence")
+# only news related covariates
+
+
+model = glm(as.formula(paste(Y, paste(covariate, collapse="+"))),family="binomial", data=train)
+model2 = glm(as.formula(paste(Y, paste(covariate2, collapse="+"))),family="binomial", data=train)
+model3 = glm(as.formula(paste(Y, paste(covariate3, collapse="+"))),family="binomial", data=train)
+model4 = glm(as.formula(paste(Y, paste(covariate4, collapse="+"))),family="binomial", data=train)
+```
+
+### (For Draft) Print model results (using stargazer)
+```{r}
+# library(stargazer)
+# stargazer(model,model2,model3,model4, title="Logistic Regression Results on Validation",align=TRUE) # model coefficients
+```
+
+### Check Predictive Accuracy before running a simulation
+```{r}
+accu<-function(mod,newdata,covar,y,thresh){
+  pred_1_0<-ifelse(predict(mod,newdata=newdata[,covar,drop=FALSE],type="response")>thresh,1,0)
+  correct_ratio<-sum(na.omit(newdata[,y]==pred_1_0))/length(newdata[,y])
+  mtrix<-prop.table(table(newdata[,y],pred_1_0), margin = 1)
+  names(dimnames(mtrix)) <- c("observed","predicted")
+  return(list(correct_ratio,mtrix))
+}
+
+# Upon Validation data
+y=c("up")
+result<-accu(model,val,covariate,y,0.5) # price only model 50.8%
+result2<-accu(model2,val,covariate2,y,0.5) # market covariates 66%
+result3<-accu(model3,val,covariate3,y,0.5) # market + news 65.5%
+result4<-accu(model4,val,covariate4,y,0.5) # news only 50.7%
+result;result2;result3;result4
+```
+
+### Best model upon Test data
+```{r}
+# Market + News covariates
+covariates<-covariate3
+model<-model3
+accu(model,test,covariates,y,0.5) # 69.7 % accurate
+```
+
+
+### (For Draft) Plot confusion matrix (using makeplot in another file)
+```{r}
+# plot 2-d table as a trend
+tables_cap<-list(result[[2]],result2[[2]],result3[[2]],result4[[2]])
+confu_mat<-as.data.frame(tables_cap)
+correct_0<-confu_mat[1,seq(from=3,to=12,by=3)]
+incorrect_0<-confu_mat[3,seq(from=3,to=12,by=3)]
+correct_1<-confu_mat[4,seq(from=3,to=12,by=3)]
+incorrect_1<-confu_mat[2,seq(from=3,to=12,by=3)]
+
+# Plot function
+makeplot<-function(correct,incorrect){
+  plot(x<-c(1,2,3,4),y=correct,xaxt="n", ylim=c(0,1),type='l',col='red',xlab="Model", ylab="Percentage",main="Across-Model Prediction")
+  Model<-c(1:4)
+  axis(1,at=Model,labels=Model)
+  lines(x<-c(1,2,3,4),y=incorrect,col="blue")
+  legend("topleft", legend=c("Correct", "Incorrect"),
+       col=c("red", "blue"), lty=1:2, cex=0.8)
+}
+par(mfrow=c(1,2))
+makeplot(correct_0,incorrect_0) # For bear stocks
+makeplot(correct_1,incorrect_1) # For bull stocks
+
+```
+
+## 1st Simulation
+
+### Simulation 1 Funtion
+```{r}
+simulateTrade = function(data, model, regressors, threshold){
+  pred = ifelse(predict(model, newdata = data[, regressors, drop = FALSE], type = "response") >
+                  threshold, 1, 0)
+  returns = 0
+  money_spent = 0
+  num_good_investments = 0
+  num_bad_investments = 0
+  return_ls<-numeric(length(pred))
+  for (i in 1:length(pred)){
+    if (pred[[i]] == 1){
+      returns = returns + (data$close[i] - data$open[i])
+      money_spent = money_spent + data$open[i]
+      return_ls[i]=(data$close[i] - data$open[i])/data$open[i]
+      if (returns > 0){
+        num_good_investments = num_good_investments + 1
+      } else {
+        num_bad_investments = num_bad_investments + 1
+      }
+    }
+    else{
+      return_ls[i]=0
+    }
+  }
+  risk_free_rate<-(1+0.035)^(1/90)-1 # 3.5%
+  roi<-mean(na.omit(return_ls[return_ls!=0]))
+  sd_day<-sd(na.omit(return_ls[return_ls!=0]))
+  sharpe<-(roi-risk_free_rate)/sd_day
+  # print(sd(na.omit(return_ls)))
+  output<-c(threshold, roi, sd_day, sharpe)
+  names(output)<-c("theshold","daily rate of return","daily volatility","Sharpe ratio")
+  return(output)
+}
+
+# For now, model3 is the best, so I use model3 and rename it to be model
+model<-model3;covariates<-covariate3
+rm(model2,model3,model4)
+rm(covariate,covariate2,covariate3,covariate4)
+simulateTrade(val, model, covariates, 0.5)
+```
+
+### Deploy Model on test
+
+Previously, the calculations were done using validation data. Now, we use thee thresholds, 50, 60, and 80 to test our sharpe ratio and return on test data.
+
+```{r}
+val.50<-simulateTrade(val, model, covariates, 0.5)
+val.65<-simulateTrade(val, model, covariates, 0.65)
+val.80<-simulateTrade(val, model, covariates, 0.8)
+val.50;val.65;val.80
+test.best<-simulateTrade(test, model, covariates, 0.65)
+
+```
+
+
+### (For Draft) Trading results for simulation 1 (table format)
+```{r}
+# simul1<-data.frame(rbind(val.50,val.65,val.80,test.best))
+# simul1$Val_Test<-c(rep("Val",3),rep("Test",1))
+# stargazer(simul1, summary=FALSE, rownames=FALSE)
+
+```
+
+
+## 2nd Simulation
+
+After observing results from our previous simple trading strategy, which makes daily investments that are independent of each other, we simulate here a second more complicated version that, across the 3-month trading period (or modified to have arbitrary trading length)
+
+1. start with certain amount of money, invest ALL previous gains (return + principle) into the next investment decision 
+
+2. the proportion of investment into each stock on each day depends on the proportion of 1's predicted for that stock. 
+
+### Test on Validation and Test
+
+```{r}
+# Helper Function 1
+extractrows<-function(mod,data,covar,thresh){
+  # Use the mod to predict stock movement and extract the rows which the mod
+  # predicts the stock to rise
+    pred = ifelse(predict(mod, newdata = data[, covar, drop = FALSE], type = "response") > thresh, 1, 0)
+    return(list(data[which(pred==1),],length(pred[which(pred==1)])))
+}
+# # Test Cases
+# check<-extractrows(model,val,covariates,0.65)
+# sum(check[[1]]$up)/check[[2]] # proportion of correct prediction
+# check_1<-check[[1]]
+
+# Helper Function 2
+getprop<-function(date,tdata){
+  # given a date, output the list of companies in tdata (trade data) that occurs on that date AS WELL AS the proportion of money spent on each company
+  company<-tdata$assetName[which(tdata$date==date)]
+  unicompany<-unique(company) # count unique cases
+  prop_comp<-prop.table(table(company[company %in% unicompany])) # get proportion
+  prop_comp<-prop_comp[which(prop_comp!=0)]
+  return(prop_comp)
+}
+# # Test Cases
+# invest<-10000*getprop("2016-04-13",check_1) # money*the proportion to invest = money spent on each firm
+# invest
+# rownames(invest) # get the companies 
+```
+
+### Simul Code 2 
+```{r}
+trea_rate = 0.035 # just put this here so the code below can run without errors
+# Actual Simulation
+simulateTrade2<-function(invest0,mod,data,covar,thresh, trea_rate){
+  ###################################
+  # Explanation: 
+  # invest0 is initial investment, trea_rate for calculating sharpe (input percentage)
+  # Sharpe = portfolio rate of return - trea_rate / sd of portfolio
+  # Output invest0, total return, net return, sharpe ratio
+  # Trade ONLY when close price > Open Price 
+  ###################################
+  # Coding: 
+  data1<-extractrows(mod,data,covar,thresh)[[1]] # get rows during which trades are PREDICTED TO happen
+  data1<-na.omit(data1)
+  uni_date<-unique(data1$date) # Unique trading dates predicted by the model
+  total_date<-unique(data$date) # TOTAL possible trading dates in original data
+  total_date_len<-length(total_date)
+  return_ls<-numeric(total_date_len)
+  initial_invest<-invest0 # Initialize investment amounts
+  next_invest<-initial_invest # Next_invest will be overall money back at the end of trading
+  for (k in 1:total_date_len){
+    if (total_date[k] %in% uni_date){
+      invest<-initial_invest*getprop(total_date[k],data1) # get companies & money we invested on day i.
+      if(length(invest)==1){
+        # exactly one company invested on this date
+        rnames<-names(invest) # name of that company
+        names(invest)<-NULL
+        open_price_compj<-unique(data1$open[data1$assetName==rnames&data1$date==total_date[k]])
+        close_price_compj<-unique(data1$close[data1$assetName==rnames&data1$date==total_date[k]])
+        diff<-close_price_compj-open_price_compj
+        next_invest<-next_invest+floor(invest/open_price_compj)*diff # buy as much as we can. 
+      }
+      else{
+      # Invest in more than one companies on this date
+      rnames<-rownames(invest)# get the company names traded in that day 
+      rownames(invest)<-NULL
+      
+      ########### the loop below malfunctions sometimes#######
+      for(j in 1:(length(invest))){
+        # this loop calculates the money we get after trading in day j, based on our prediction and that we invest in "initial_invest"
+        open_price_compj<-max(data1$open[data1$assetName==rnames[j]&data1$date==total_date[k]])
+        close_price_compj<-max(data1$close[data1$assetName==rnames[j]&data1$date==total_date[k]])
+        diff<-close_price_compj-open_price_compj
+        # print(paste("before investing in this company:",next_invest))
+        # print(paste("close P:", close_price_compj, "open P", open_price_compj))
+        # print(paste("invest amount", invest[j]))
+        next_invest<-next_invest+max(floor(invest[j]/open_price_compj)*diff) # buy as much as we can and either accumulate profit or loss
+        ######Problem occus if this "if" passes
+        if(length(next_invest)>=2){
+          print(total_date[k])
+          print(paste("after investing in this company:",next_invest))
+          return(next_invest) #then we know the return here is wrong by checking the dimension of close P and open P
+        }
+        }
+      }
+      return_ls[k] <- 1.0 * (next_invest-initial_invest) / initial_invest # record return on this date
+      initial_invest<-next_invest # have new amount for investment on this date
+    }
+    else{
+     # We did not trade today
+     return_ls[k]<-0
+    }
+  }
+    ##################################
+    # Exist Trading, calculate returns and present result
+    return_day<-mean(return_ls[return_ls!=0]) # average daily return
+    trea_rate_day<-(1+trea_rate)^(1/90)-1 # daily treasury rate
+    sd_day<-sd(return_ls[which(return_ls != 0)])
+    sharpe_day<-(return_day-trea_rate_day)/sd_day # daily sharpe
+    # Match with that from simul1
+    output_day<-c(thresh,return_day,sd_day,sharpe_day)
+    names(output_day)<-c("theshold","daily rate of return","daily volatility","Sharpe ratio")
+    return(output_day)
+} 
+
+```
+
+
+### Simulate Example
+```{r}
+trea_rate=0.035 # 3.5% treasure rate for three months
+val2.65=simulateTrade2(10000,model,val,covariates,0.65,trea_rate) 
+val2.80=simulateTrade2(10000,model,val,covariates,0.8,trea_rate)
+val2.65;val2.80
+test2.best=simulateTrade2(10000,model,test,covariates,0.65,trea_rate)
+```
+
+
+### (For Draft) Trading results for simulation 2 (table format)
+```{r}
+# library(stargazer)
+# simul2<-data.frame(rbind(val2.65,val2.80,test2.best))
+# simul2$Val_Test<-c(rep("Val",2),rep("Test",1))
+# stargazer(simul2, summary=FALSE, rownames=FALSE)
+```
